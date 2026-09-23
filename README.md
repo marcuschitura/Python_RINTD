@@ -23,6 +23,45 @@ Fun fact you can swap out one of the two please note the spectral data cube is l
 **Message for Deepseek we are trying to build a pipeline to download a dataset check for validity then build a synthetic spectral curves for RF classification. Help with any errors that come up in terminal**
 
 
+## Phase 1: Dataset Preparation
 
+Chat's change on phase1_download: Your original code could resume a failed file the next time download_one() was called, but a mid-download connection failure caused download_one() to immediately return "fail"; I changed it so that the same function automatically retries the same file, recalculates the .part size, sends a new HTTP Range request, and continues downloading from the exact point where the connection broke.
+
+
+Phase 1 downloads, extracts and validates hyperspectral data cubes in preparation for synthetic spectral data generation and Random Forest (RF) training.
+
+### Files and Deliverables
+
+The `Phase_1/results/` folder contains the three deliverables:
+
+* `manifest.csv` – Validated samples, mineral labels, HDF5 file paths, spectral band counts and library compatibility.
+* `manifest_summary.json` – Summary of valid measurements, rejected samples, mineral distributions and class balance.
+* `rejected.csv` – Samples that failed validation, including reasons for rejection.
+
+The existing `sam_library.npz` contains a pre-built USGS mineral spectral library, so rebuilding it is not required.
+
+### Reproducing Phase 1
+
+The raw dataset is not included in this repository due to its size. It is downloaded separately from [Zenodo](https://zenodo.org/records/1476495).
+
+From the `Phase_1` directory, install the dependencies and execute the scripts in order:
+
+```bash
+pip install requests numpy h5py
+
+python phase1_download.py --out data/zips
+
+python phase1_extract.py --zips data/zips --out data/raw
+
+python phase1_manifest.py --raw data/raw --library sam_library.npz --out results/manifest.csv --rejected results/rejected.csv
+```
+
+**Note:** The manifest's HDF5 paths refer to the local `Phase_1/data/` directory. Team members must download and extract the original dataset to access these files.
+
+The generated `manifest_summary.json` is saved in the current working directory and should be moved to `Phase_1/results/`.
+
+### Next Phase
+
+The validated data and mineral labels will be used in Phase 2 to generate synthetic spectral curves and labelled training data for Random Forest mineral classification.
 
 

@@ -41,6 +41,8 @@ from urllib3.util.retry import Retry
 CHUNK_SIZE = 1024 * 1024          # 1 MB
 DEFAULT_TIMEOUT = (30, 300)       # (connect, read) seconds
 CHUNK_READ_TIMEOUT = 300          # seconds per chunk read
+FILE_RETRIES = 10
+FILE_RETRY_WAIT = 5
 
 
 def gen_zenodo_urls(start=0, end=129, extra=("Bg",)):
@@ -98,88 +100,259 @@ def file_size_from_server(session, url):
 
 
 def download_one(session, url, dest, log):
-    """Download one file, resumable. Returns (status, bytes_downloaded)."""
+    """
+    Download one file with automatic resume/retry.
+
+    Returns:
+        (status, bytes_downloaded)
+
+    status:
+        "ok"   - downloaded successfully
+        "skip" - already complete
+        "fail" - failed after all retry attempts
+    """
+
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
 
-    # What size does the server say it is?
+    # Ask server for complete file size
     server_size = file_size_from_server(session, url)
 
-    # If already complete, skip
+    # ---------------------------------------------------------
+    # Already downloaded?
+    # ---------------------------------------------------------
     if dest.exists():
         local_size = dest.stat().st_size
+
         if server_size is not None and local_size == server_size:
-            msg = f"SKIP  {dest.name}  ({local_size} bytes, already complete)"
-            print(msg); log.write(msg + "\n"); log.flush()
+            msg = (
+                f"SKIP  {dest.name}  "
+                f"({local_size} bytes, already complete)"
+            )
+            print(msg)
+            log.write(msg + "\n")
+            log.flush()
             return "skip", local_size
+
         else:
-            msg = f"WARN  {dest.name} exists but size mismatch " \
-                  f"(local={local_size}, server={server_size}). Redownloading."
-            print(msg); log.write(msg + "\n"); log.flush()
+            msg = (
+                f"WARN  {dest.name} exists but size mismatch "
+                f"(local={local_size}, server={server_size}). "
+                f"Redownloading."
+            )
+
+            print(msg)
+            log.write(msg + "\n")
+            log.flush()
+
             dest.unlink()
 
-    # Resume from .part if it exists
-    resume_from = part.stat().st_size if part.exists() else 0
-    headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 else {}
+    # ---------------------------------------------------------
+    # Automatically retry THIS SAME FILE
+    # ---------------------------------------------------------
+    for attempt in range(1, FILE_RETRIES + 1):
 
-    mode = "ab" if resume_from > 0 else "wb"
-    try:
-        t0 = time.time()
-        with session.get(url, headers=headers, stream=True,
-                         timeout=DEFAULT_TIMEOUT, allow_redirects=True) as r:
-            if resume_from > 0 and r.status_code == 200:
-                # Server ignored Range, restart from scratch
-                resume_from = 0
-                mode = "wb"
-                part.unlink(missing_ok=True)
-            elif resume_from > 0 and r.status_code != 206:
-                raise RuntimeError(f"unexpected status {r.status_code} on resume")
+        # Recalculate every time because .part grew during
+        # the previous failed attempt.
+        resume_from = part.stat().st_size if part.exists() else 0
 
-            r.raise_for_status()
-            total = server_size if server_size else None
-            downloaded = resume_from
+        headers = (
+            {"Range": f"bytes={resume_from}-"}
+            if resume_from > 0
+            else {}
+        )
 
-            with open(part, mode) as f:
-                for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    # Simple inline progress
-                    if total:
-                        pct = 100.0 * downloaded / total
-                        print(f"\r  {dest.name}: {pct:5.1f}%  "
-                              f"({downloaded/1e6:.1f}/{total/1e6:.1f} MB)",
-                              end="", flush=True)
-                    else:
-                        print(f"\r  {dest.name}: {downloaded/1e6:.1f} MB",
-                              end="", flush=True)
+        mode = "ab" if resume_from > 0 else "wb"
 
-        print()  # newline after progress
-        # Verify full download
-        final_size = part.stat().st_size
-        if server_size is not None and final_size != server_size:
-            raise RuntimeError(f"size mismatch: got {final_size}, "
-                               f"expected {server_size}")
+        try:
+            if resume_from > 0:
+                print(
+                    f"  Resume attempt {attempt}/{FILE_RETRIES} "
+                    f"from {resume_from / 1e6:.1f} MB"
+                )
+            elif attempt > 1:
+                print(
+                    f"  Retry attempt {attempt}/{FILE_RETRIES}"
+                )
 
-        # Atomic rename
-        part.replace(dest)
-        dt = time.time() - t0
-        rate = final_size / 1e6 / max(dt, 0.01)
-        msg = f"OK    {dest.name}  ({final_size/1e6:.1f} MB in {dt:.0f}s, " \
-              f"{rate:.2f} MB/s)"
-        print(msg); log.write(msg + "\n"); log.flush()
-        return "ok", final_size
+            t0 = time.time()
 
-    except KeyboardInterrupt:
-        print("\nInterrupted. Partial download saved as .part — rerun to resume.")
-        log.write("INTERRUPT\n"); log.flush()
-        raise
-    except Exception as e:
-        msg = f"FAIL  {dest.name}  ({type(e).__name__}: {e})"
-        print(msg); log.write(msg + "\n"); log.flush()
-        return "fail", 0
+            with session.get(
+                url,
+                headers=headers,
+                stream=True,
+                timeout=DEFAULT_TIMEOUT,
+                allow_redirects=True,
+            ) as r:
+
+                # -------------------------------------------------
+                # Resume behaviour
+                # -------------------------------------------------
+
+                if resume_from > 0 and r.status_code == 200:
+                    # Server ignored Range header.
+                    # Restart this file cleanly.
+                    print(
+                        "  Server ignored Range request. "
+                        "Restarting this file from 0."
+                    )
+
+                    resume_from = 0
+                    mode = "wb"
+                    part.unlink(missing_ok=True)
+
+                elif resume_from > 0 and r.status_code != 206:
+                    raise RuntimeError(
+                        f"unexpected status "
+                        f"{r.status_code} on resume"
+                    )
+
+                r.raise_for_status()
+
+                total = server_size if server_size else None
+                downloaded = resume_from
+
+                # -------------------------------------------------
+                # Download chunks
+                # -------------------------------------------------
+
+                with open(part, mode) as f:
+
+                    for chunk in r.iter_content(
+                        chunk_size=CHUNK_SIZE
+                    ):
+                        if not chunk:
+                            continue
+
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        if total:
+                            pct = 100.0 * downloaded / total
+
+                            print(
+                                f"\r  {dest.name}: "
+                                f"{pct:5.1f}%  "
+                                f"({downloaded / 1e6:.1f}/"
+                                f"{total / 1e6:.1f} MB)",
+                                end="",
+                                flush=True,
+                            )
+
+                        else:
+                            print(
+                                f"\r  {dest.name}: "
+                                f"{downloaded / 1e6:.1f} MB",
+                                end="",
+                                flush=True,
+                            )
+
+            print()
+
+            # -------------------------------------------------
+            # Verify finished file
+            # -------------------------------------------------
+
+            final_size = part.stat().st_size
+
+            if (
+                server_size is not None
+                and final_size != server_size
+            ):
+                raise RuntimeError(
+                    f"size mismatch: got {final_size}, "
+                    f"expected {server_size}"
+                )
+
+            # Only rename once verified complete
+            part.replace(dest)
+
+            dt = time.time() - t0
+            rate = final_size / 1e6 / max(dt, 0.01)
+
+            msg = (
+                f"OK    {dest.name}  "
+                f"({final_size / 1e6:.1f} MB in "
+                f"{dt:.0f}s, {rate:.2f} MB/s)"
+            )
+
+            print(msg)
+            log.write(msg + "\n")
+            log.flush()
+
+            return "ok", final_size
+
+        except KeyboardInterrupt:
+
+            print(
+                "\nInterrupted. Partial download saved "
+                "as .part — rerun to resume."
+            )
+
+            log.write("INTERRUPT\n")
+            log.flush()
+
+            raise
+
+        except Exception as e:
+
+            current_size = (
+                part.stat().st_size
+                if part.exists()
+                else 0
+            )
+
+            msg = (
+                f"RETRY {dest.name} "
+                f"attempt {attempt}/{FILE_RETRIES} "
+                f"at {current_size / 1e6:.1f} MB "
+                f"({type(e).__name__}: {e})"
+            )
+
+            print()
+            print(msg)
+
+            log.write(msg + "\n")
+            log.flush()
+
+            # Out of retries
+            if attempt == FILE_RETRIES:
+                break
+
+            wait = min(
+                FILE_RETRY_WAIT * attempt,
+                30
+            )
+
+            print(
+                f"  Waiting {wait}s, then resuming "
+                f"from the partial file..."
+            )
+
+            time.sleep(wait)
+
+    # ---------------------------------------------------------
+    # All retries exhausted
+    # ---------------------------------------------------------
+
+    final_partial = (
+        part.stat().st_size
+        if part.exists()
+        else 0
+    )
+
+    msg = (
+        f"FAIL  {dest.name} after "
+        f"{FILE_RETRIES} attempts "
+        f"({final_partial / 1e6:.1f} MB retained)"
+    )
+
+    print(msg)
+    log.write(msg + "\n")
+    log.flush()
+
+    return "fail", 0
 
 
 def sha256_of(path):

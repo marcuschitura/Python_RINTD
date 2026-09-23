@@ -1,0 +1,13 @@
+# Python environment
+.venv/
+__pycache__/
+
+# Large downloaded datasets
+Phase_1/data/
+
+# Generated logs
+Phase_1/download_log.txt
+Phase_1/extract_log.txt
+
+# Incomplete downloads
+*.part
